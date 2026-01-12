@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .db import init_db, get_db
+from db import init_db, get_db
 
 
 APP = FastAPI(title="NeoMindzLive API")
