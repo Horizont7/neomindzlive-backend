@@ -3,6 +3,7 @@
 # run: python -m uvicorn app:APP --reload --host 127.0.0.1 --port 8000
 
 import os, json, uuid, datetime, random
+import hmac, hashlib
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, Request
@@ -27,6 +28,8 @@ APP.add_middleware(
 BASE_DIR = os.path.dirname(__file__)
 
 PRICE_AMOUNT = float(os.getenv("PRICE_AMOUNT", "1.49"))
+PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "")  # Paddle Billing webhook secret
+
 
 # Default: generator chiqargan bank
 QB_PATH = os.getenv("QUESTION_BANK_PATH", os.path.join(BASE_DIR, "question_bank_generated.json"))
@@ -352,8 +355,9 @@ class AnswerRequest(BaseModel):
 
 
 class UnlockRequest(BaseModel):
+    """Deprecated (DEV-only old flow). Do NOT use in production."""
     session_id: str
-    paid: bool = True
+    paid: bool = False
     paddle_txn_id: Optional[str] = None
 
 
@@ -579,42 +583,136 @@ def test_answer(request: Request, payload: AnswerRequest):
 @APP.post("/api/payment/unlock")
 def unlock_result(request: Request, payload: UnlockRequest):
     """
-    HOZIRCHA DEMO: frontend paid=true yuborsa unlock bo'ladi.
-    Keyingi bosqichda Paddle webhook bilan faqat payment_succeeded bo'lsa unlock qilamiz.
+    ❌ Deprecated endpoint.
+    Production'da unlock faqat Paddle webhook (/api/paddle/webhook) orqali bo'ladi.
     """
-    user_id = ensure_user_id(request)
-    if not payload.paid:
-        raise HTTPException(402, "Payment required.")
+    raise HTTPException(
+        status_code=410,
+        detail="Deprecated. Complete payment via Paddle Checkout; unlock is applied by webhook.",
+    )
+
+
+# ===================== PADDLE WEBHOOK (PROD) =====================
+def _verify_paddle_signature(sig_header: str, body: bytes, secret: str) -> bool:
+    """
+    Paddle Billing uslubidagi webhook signature tekshiruvi (common pattern).
+    Header: 'Paddle-Signature: ts=...,h1=...'
+    Note: Agar siz Classic Paddle ishlatsangiz, verify algoritmi boshqacha bo'lishi mumkin.
+    """
+    if not secret or not sig_header:
+        return False
+    try:
+        parts = {}
+        for part in sig_header.split(","):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                parts[k.strip()] = v.strip()
+        ts = parts.get("ts")
+        h1 = parts.get("h1")
+        if not ts or not h1:
+            return False
+        msg = (ts + ":").encode("utf-8") + body
+        digest = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(digest, h1)
+    except Exception:
+        return False
+
+
+@APP.post("/api/paddle/webhook")
+async def paddle_webhook(request: Request):
+    """
+    ✅ 100% lock yopish shu yerda:
+    - Paddle webhook signature tekshiriladi
+    - payment succeeded bo'lsa session unlock qilinadi
+    Frontend'dan "paid:true" yuborib unlock qilish endi ishlamaydi.
+    """
+    body = await request.body()
+    sig = request.headers.get("Paddle-Signature") or request.headers.get("paddle-signature") or ""
+    if not _verify_paddle_signature(sig, body, PADDLE_WEBHOOK_SECRET):
+        raise HTTPException(401, "Invalid webhook signature.")
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "Invalid JSON.")
+
+    event_type = payload.get("event_type") or payload.get("alert_name") or ""
+    data = payload.get("data") or payload
+
+    # session_id ni custom_data yoki passthrough'dan olamiz
+    session_id = None
+    user_id = None
+
+    if isinstance(data, dict):
+        custom = data.get("custom_data")
+        if isinstance(custom, dict):
+            session_id = custom.get("session_id")
+            user_id = custom.get("user_id")
+
+        if not session_id:
+            passthrough = data.get("passthrough")
+            if isinstance(passthrough, str) and passthrough:
+                try:
+                    pt = json.loads(passthrough)
+                    session_id = pt.get("session_id")
+                    user_id = user_id or pt.get("user_id")
+                except Exception:
+                    pass
+
+    if not session_id:
+        # webhooksiz unlock bo'lmaydi
+        return {"ok": True, "ignored": True, "reason": "No session_id"}
+
+    # One-time payment eventlar
+    ok_events = {
+        "transaction.completed",
+        "payment_succeeded",
+        "checkout.completed",
+        "order.paid",
+    }
+    if event_type not in ok_events:
+        return {"ok": True, "ignored": True, "event_type": event_type}
+
+    paddle_txn_id = None
+    if isinstance(data, dict):
+        paddle_txn_id = (
+            data.get("transaction_id")
+            or data.get("id")
+            or data.get("order_id")
+            or data.get("checkout_id")
+            or None
+        )
 
     with get_db() as con:
         ensure_schema(con)
         cur = con.cursor()
 
-        cur.execute("SELECT * FROM test_sessions WHERE id=? AND user_id=?", (payload.session_id, user_id))
+        # session topamiz
+        cur.execute("SELECT * FROM test_sessions WHERE id=?", (session_id,))
         sess = cur.fetchone()
         if not sess:
-            raise HTTPException(404, "Session not found.")
-        if sess["status"] != "completed":
-            raise HTTPException(400, "Session is not completed yet.")
+            return {"ok": True, "ignored": True, "reason": "Session not found"}
 
-        # Already unlocked?
+        if user_id is None:
+            user_id = sess["user_id"]
+
+        # idempotent
         if safe_int(row_get(sess, "result_locked", 1), 1) == 0:
-            return {"ok": True, "session_id": payload.session_id, "already_unlocked": True}
+            return {"ok": True, "already_unlocked": True, "session_id": session_id}
 
-        token_id = create_token(con, user_id, paddle_txn_id=payload.paddle_txn_id or "MANUAL")
-        mark_token_used(con, token_id)
+        token_id = create_token(con, user_id=user_id, paddle_txn_id=paddle_txn_id)
 
         cur.execute(
             """
             UPDATE test_sessions
             SET result_locked=0, unlock_token_id=?
-            WHERE id=? AND user_id=?
+            WHERE id=?
             """,
-            (token_id, payload.session_id, user_id),
+            (token_id, session_id),
         )
         con.commit()
 
-        return {"ok": True, "session_id": payload.session_id, "unlock_token_id": token_id}
+    return {"ok": True, "unlocked": True, "session_id": session_id}
 
 
 # ===================== GET RESULT (only if unlocked) =====================
@@ -647,19 +745,25 @@ def get_result(request: Request, session_id: str):
 
 # ===================== STATUS =====================
 @APP.get("/api/test/status")
-def test_status(request: Request):
+def test_status(request: Request, session_id: Optional[str] = None):
+    """
+    session_id berilsa shu session status qaytaradi, aks holda oxirgi session.
+    """
     user_id = ensure_user_id(request)
     with get_db() as con:
         ensure_schema(con)
         cur = con.cursor()
-        cur.execute(
-            """
-            SELECT * FROM test_sessions
-            WHERE user_id=?
-            ORDER BY started_at DESC LIMIT 1
-            """,
-            (user_id,),
-        )
+        if session_id:
+            cur.execute("SELECT * FROM test_sessions WHERE id=? AND user_id=?", (session_id, user_id))
+        else:
+            cur.execute(
+                """
+                SELECT * FROM test_sessions
+                WHERE user_id=?
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (user_id,),
+            )
         sess = cur.fetchone()
         return {"session": dict(sess) if sess else None}
 
